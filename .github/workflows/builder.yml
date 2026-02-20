@@ -1,0 +1,146 @@
+name: Build
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag for build (eg, v1.3.13), empty for latest."
+        required: false
+        type: string
+      force:
+        description: "Force build"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: windows-latest
+    steps:
+      - name: Target Version
+        id: version
+        shell: pwsh
+        run: |
+          $targetTag = "${{ inputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($targetTag)) {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/aseprite/aseprite/releases/latest"
+            $targetTag = $release.tag_name
+          }
+          Write-Output "target_tag=$targetTag" >> $env:GITHUB_OUTPUT
+          Write-Host "Target = $targetTag"
+
+      - name: Check Exists
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ("${{ inputs.force }}" -eq "true") {
+            Write-Host "Force build request."
+            Write-Output "exists=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $tag = "${{ steps.version.outputs.target_tag }}"
+          $releases = gh release list -R ${{ github.repository }} --json tagName | ConvertFrom-Json
+          if ($releases.tagName -contains $tag) {
+            Write-Host "Release $tag already exist. Skip build."
+            Write-Output "exists=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "exists=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Checkout
+        if: steps.check.outputs.exists != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: "aseprite/aseprite"
+          ref: ${{ steps.version.outputs.target_tag }}
+          submodules: "recursive"
+          path: "aseprite"
+          fetch-depth: 1
+
+      - name: Download Skia (m124)
+        if: steps.check.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $skiaUrl = "https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip"
+          Invoke-WebRequest -Uri $skiaUrl -OutFile "skia.zip"
+          Expand-Archive -Path "skia.zip" -DestinationPath "${{ github.workspace }}\skia"
+
+      - name: Compile
+        if: steps.check.outputs.exists != 'true'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (set "VS_PATH=%%i")
+          call "%VS_PATH%\Common7\Tools\VsDevCmd.bat" -arch=x64
+
+          cd aseprite
+          mkdir build
+          cd build
+
+          cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
+            -DLAF_BACKEND=skia ^
+            -DSKIA_DIR="%GITHUB_WORKSPACE%\skia" ^
+            -DSKIA_LIBRARY_DIR="%GITHUB_WORKSPACE%\skia\out\Release-x64" ^
+            -DSKIA_LIBRARY="%GITHUB_WORKSPACE%\skia\out\Release-x64\skia.lib" ^
+            -DENABLE_OPENSSL=OFF ^
+            -DENABLE_CURL=OFF ^
+            -DENABLE_WEBSOCKET=OFF ^
+            -DENABLE_NEWS=OFF ^
+            -DENABLE_UPDATER=OFF ^
+            -G Ninja ..
+            
+          ninja aseprite
+
+      - name: Package Release
+        if: steps.check.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.target_tag }}"
+          $binDir = "aseprite\build\bin"
+          mkdir dist
+
+          Copy-Item "$binDir\aseprite.exe" -Destination "dist\"
+          Copy-Item "$binDir\icudtl.dat" -Destination "dist\"
+          Copy-Item "$binDir\data" -Destination "dist\" -Recurse
+
+          New-Item -Path "dist\aseprite.ini" -ItemType File
+
+          Remove-Item "dist\*.pdb" -ErrorAction SilentlyContinue
+
+          Compress-Archive -Path "dist\*" -DestinationPath "Aseprite-$tag-Windows-x64.zip"
+
+      - name: Release (Draft)
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.target_tag }}"
+
+          try {
+            $rawBody = gh release view $tag -R aseprite/aseprite --json body --jq .body
+            $body = ($rawBody -is [array]) ? ($rawBody -join "`n") : $rawBody
+            if ([string]::IsNullOrWhiteSpace($body)) { $body = "Original release notes empty." }
+          } catch {
+            $body = "Original release notes not available."
+          }
+
+          $header = "### Build Info`n" +
+                    "* **Clean Build:** No dependencies.`n" +
+                    "* **Portable Mode:** Enabled (aseprite.ini included).`n"
+
+          $finalNotes = $header + $body
+          [System.IO.File]::WriteAllText("${{ github.workspace }}\release_notes.md", $finalNotes)
+
+          gh release create $tag "Aseprite-$tag-Windows-x64.zip" `
+            -R ${{ github.repository }} `
+            --title "Aseprite $tag" `
+            --notes-file "release_notes.md" `
+            --draft
